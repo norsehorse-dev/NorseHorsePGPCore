@@ -1,0 +1,8 @@
+NorseHorsePGPCore
+Copyright 2026 NorseHorse
+
+This product includes software developed by NorseHorse as the shared
+OpenPGP core of the NorseHorse app portfolio, extracted from PGPonyCore,
+the auditable crypto core of PGPony (https://pgpony.app).
+
+Licensed under the Apache License, Version 2.0. See LICENSE for details.
