@@ -17,8 +17,10 @@ app code, just the core.
 
 ## What's in here
 
-A self-contained OpenPGP implementation with **no third-party dependencies** — system
-frameworks only (Foundation, CryptoKit, CommonCrypto, Security, CoreNFC, zlib).
+A self-contained OpenPGP implementation with **one third-party dependency**: a pinned,
+vendored build of liboqs for ML-KEM-768 and SHA3-256 (version, build flags and hashes in
+`Vendor/LIBOQS.md`). Everything else is system frameworks (Foundation, CryptoKit,
+CommonCrypto, Security, CoreNFC, zlib).
 
 | Area | Files |
 |---|---|

@@ -10,7 +10,7 @@ import Foundation
 // is the caller's responsibility (e.g. the Keychain).
 
 public struct GeneratedIdentity: Sendable {
-    /// Uppercase 40-hex primary key fingerprint.
+    /// Uppercase primary key fingerprint: 40 hex for v4, 64 hex for v6.
     public let fingerprint: String
     /// Serialized OpenPGP transferable secret key bytes.
     public let secretKey: Data
@@ -31,6 +31,20 @@ public enum OpenPGPKeyGenerator {
             passphrase: nil,
             expirationInterval: nil
         )
+        return GeneratedIdentity(
+            fingerprint: result.fingerprint.uppercased(),
+            secretKey: result.privateKeyData,
+            armoredPublicKey: result.armoredPublicKey,
+            armoredSecretKey: result.armoredPrivateKey
+        )
+    }
+
+    /// Generate a fresh v6 (RFC 9580) identity: an Ed25519 primary that certifies
+    /// and signs, with one ML-KEM-768 + X25519 (algorithm 35) encryption subkey.
+    /// The same shape the Android core makes in CPIdentityGenerator. The
+    /// fingerprint is 64 hex.
+    public static func generateV6Identity(name: String, email: String) throws -> GeneratedIdentity {
+        let result = try V6KeyGenerator.generateCompositeIdentity(name: name, email: email)
         return GeneratedIdentity(
             fingerprint: result.fingerprint.uppercased(),
             secretKey: result.privateKeyData,

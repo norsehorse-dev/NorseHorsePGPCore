@@ -260,6 +260,110 @@ class V6KeyGenerator {
         )
     }
 
+    // MARK: - Generate (signing primary + ML-KEM-768/X25519 subkey)
+
+    private static let algoMLKEM768X25519: UInt8 = 35   // RFC 9980 composite KEM
+
+    /// A v6 messaging identity in the shape CarrierPony uses on both platforms:
+    ///
+    ///   primary   Ed25519, flagged to certify AND sign
+    ///   subkey    ML-KEM-768 + X25519 (algorithm 35), flagged to encrypt
+    ///
+    /// There is no signing subkey, so every signature this identity makes names
+    /// the primary as issuer and the identity's fingerprint is the signer's
+    /// fingerprint. An encryption subkey needs no back-signature. The secret key
+    /// is unprotected (S2K usage 0); the caller keeps it in the Keychain.
+    ///
+    /// Packet order: primary | DirectKey | UID | PositiveCert | subkey | binding.
+    /// Subkey material: X25519 public (32) then ML-KEM public (1184); secret is
+    /// X25519 secret (32) then the ML-KEM seed (64).
+    static func generateCompositeIdentity(name: String, email: String) throws -> V6KeyGeneratorResult {
+
+        let creationTime = UInt32(Date().timeIntervalSince1970)
+
+        let signingKey = Curve25519.Signing.PrivateKey()
+        let signingPub  = Array(signingKey.publicKey.rawRepresentation)
+        let signingPriv = Array(signingKey.rawRepresentation)
+
+        let kem = try CompositeKEM.generateKeyPair()
+
+        let primaryPubBody = buildV6PublicKeyBody(
+            creationTime: creationTime,
+            algorithm: algoEd25519,
+            keyMaterial: signingPub
+        )
+        let fingerprint = computeV6Fingerprint(packetBody: primaryPubBody)
+
+        let userIDBytes = Array("\(name) <\(email)>".utf8)
+
+        let directKeySig = try buildV6DirectKeySignature(
+            signingKey: signingKey,
+            primaryKeyBody: primaryPubBody,
+            primaryFingerprint: fingerprint,
+            creationTime: creationTime,
+            expirationInterval: nil,
+            keyFlags: 0x03
+        )
+        let selfSig = try buildV6CertificationSignature(
+            signingKey: signingKey,
+            primaryKeyBody: primaryPubBody,
+            primaryFingerprint: fingerprint,
+            userIDBytes: userIDBytes,
+            creationTime: creationTime
+        )
+
+        let subkeyPubBody = buildV6PublicKeyBody(
+            creationTime: creationTime,
+            algorithm: algoMLKEM768X25519,
+            keyMaterial: Array(kem.publicKey)
+        )
+        let subkeyBindingSig = try buildV6SubkeyBindingSignature(
+            signingKey: signingKey,
+            primaryKeyBody: primaryPubBody,
+            primaryFingerprint: fingerprint,
+            subkeyBody: subkeyPubBody,
+            creationTime: creationTime,
+            keyFlags: 0x0C
+        )
+
+        var pubKeyPackets = Data()
+        pubKeyPackets.append(buildPacket(tag: 6,  body: Data(primaryPubBody)))
+        pubKeyPackets.append(buildPacket(tag: 2,  body: Data(directKeySig)))
+        pubKeyPackets.append(buildPacket(tag: 13, body: Data(userIDBytes)))
+        pubKeyPackets.append(buildPacket(tag: 2,  body: Data(selfSig)))
+        pubKeyPackets.append(buildPacket(tag: 14, body: Data(subkeyPubBody)))
+        pubKeyPackets.append(buildPacket(tag: 2,  body: Data(subkeyBindingSig)))
+
+        let primarySecretBody = try buildV6SecretKeyBody(
+            publicBody: primaryPubBody,
+            rawPrivateKey: signingPriv,
+            lock: nil,
+            packetTagID: 0xC5
+        )
+        let subkeySecretBody = try buildV6SecretKeyBody(
+            publicBody: subkeyPubBody,
+            rawPrivateKey: Array(kem.secretKey),
+            lock: nil,
+            packetTagID: 0xC7
+        )
+
+        var secretKeyPackets = Data()
+        secretKeyPackets.append(buildPacket(tag: 5,  body: Data(primarySecretBody)))
+        secretKeyPackets.append(buildPacket(tag: 2,  body: Data(directKeySig)))
+        secretKeyPackets.append(buildPacket(tag: 13, body: Data(userIDBytes)))
+        secretKeyPackets.append(buildPacket(tag: 2,  body: Data(selfSig)))
+        secretKeyPackets.append(buildPacket(tag: 7,  body: Data(subkeySecretBody)))
+        secretKeyPackets.append(buildPacket(tag: 2,  body: Data(subkeyBindingSig)))
+
+        return V6KeyGeneratorResult(
+            fingerprint: fingerprint.map { String(format: "%02x", $0) }.joined(),
+            publicKeyData: pubKeyPackets,
+            privateKeyData: secretKeyPackets,
+            armoredPublicKey: armorData(pubKeyPackets, type: .publicKey),
+            armoredPrivateKey: armorData(secretKeyPackets, type: .secretKey)
+        )
+    }
+
     // MARK: - v6 Public Key Body
 
     /// Build a v6 public-key packet body (used for both primary tag 6 and subkey tag 14):
@@ -450,7 +554,8 @@ class V6KeyGenerator {
         primaryKeyBody: [UInt8],
         primaryFingerprint: [UInt8],
         creationTime: UInt32,
-        expirationInterval: TimeInterval?
+        expirationInterval: TimeInterval?,
+        keyFlags: UInt8 = 0x01
     ) throws -> [UInt8] {
 
         var hashedSubpackets = Data()
@@ -462,7 +567,9 @@ class V6KeyGenerator {
         // signs data directly — a dedicated Ed25519 signing subkey does — matching
         // the sq/GnuPG/PGPony-Android default v6 layout. (Certify, 0x01, still lets
         // the primary issue its own self-sigs and subkey bindings.)
-        hashedSubpackets.append(buildSubpacket(type: 27, data: [0x01], critical: true))
+        // generateCompositeIdentity passes 0x03 (certify and sign) instead: its
+        // primary signs data itself and there is no signing subkey.
+        hashedSubpackets.append(buildSubpacket(type: 27, data: [keyFlags], critical: true))
 
         // Type 11: preferred symmetric algorithms (AES-256, AES-128) — match Sequoia's defaults
         hashedSubpackets.append(buildSubpacket(type: 11, data: [9, 7]))

@@ -162,6 +162,12 @@ public struct Cv25519Recipient {
     let kdfCipherID: UInt8           // From KDF params (usually AES-128 = 7)
 }
 
+/// A v6 ML-KEM-768 + X25519 (algorithm 35) recipient subkey.
+public struct CompositeKEMRecipient {
+    let subkeyPublicKey: [UInt8]     // 1216 octets: X25519 public (32) then ML-KEM public (1184)
+    let subkeyFingerprint: [UInt8]   // 32-byte v6 fingerprint of the subkey
+}
+
 /// An RSA recipient (the encryption-capable (sub)key) for a v3 PKESK. The session
 /// key is encrypted to the modulus with PKCS#1 v1.5 padding.
 public struct RSARecipient {
@@ -212,8 +218,39 @@ public final class OpenPGPPacketBuilder {
         signingInfo: Ed25519SigningInfo? = nil,
         prebuiltSignature: (packet: [UInt8], keyID: [UInt8])? = nil,
         filename: String? = nil,
-        armor: Bool = true
+        armor: Bool = true,
+        compositeRecipients: [CompositeKEMRecipient] = []
     ) throws -> Data {
+
+        // A recipient with an ML-KEM-768 + X25519 subkey gets a v6 PKESK for
+        // that subkey and a SEIPDv2 (AES-256-OCB) body. Such a message is never
+        // also addressed to a classical key: that would let whoever breaks the
+        // classical key read it, which is the thing the subkey exists to stop.
+        if !compositeRecipients.isEmpty {
+            guard recipients.isEmpty, rsaRecipients.isEmpty else {
+                throw PacketBuilderError.invalidKeyData("ML-KEM recipients cannot be mixed with classical recipients")
+            }
+            var sessionKey = [UInt8](repeating: 0, count: 32)
+            guard SecRandomCopyBytes(kSecRandomDefault, sessionKey.count, &sessionKey) == errSecSuccess else {
+                throw PacketBuilderError.sessionKeyGenerationFailed
+            }
+            var message = Data()
+            for recipient in compositeRecipients {
+                message.append(try buildCompositePKESKPacket(sessionKey: sessionKey, recipient: recipient))
+            }
+            message.append(try buildSEIPDv2Packet(
+                plaintext: Array(plaintext),
+                sessionKey: sessionKey,
+                cipherAlgorithmID: 9,
+                signingInfo: signingInfo,
+                prebuiltSignature: prebuiltSignature,
+                filename: filename
+            ))
+            if armor {
+                return armorMessage(message).data(using: .utf8) ?? message
+            }
+            return message
+        }
 
         guard !recipients.isEmpty || !rsaRecipients.isEmpty else {
             throw PacketBuilderError.noRecipients
@@ -612,6 +649,46 @@ public final class OpenPGPPacketBuilder {
         body.append(contentsOf: ephemeral)                    // 32-byte ephemeral public key
         body.append(UInt8(wrapped.count))                     // size of following fields (no algo id in v6)
         body.append(contentsOf: wrapped)                      // wrapped session key
+
+        return buildNewFormatPacket(tag: 1, body: Data(body))
+    }
+
+    /// RFC 9980 v6 PKESK (tag 1) for an ML-KEM-768 + X25519 recipient.
+    /// Layout: version(6) | size(33) | keyVersion(6) | fingerprint(32) | algo(35) |
+    ///         X25519 ephemeral(32) | ML-KEM ciphertext(1088) | size(1) | wrapped session key
+    /// The session key is wrapped bare (RFC 3394, AES-256): a v6 PKESK carries
+    /// no cipher octet and no checksum. Same bytes the Android core writes in
+    /// CPCompositeMessage.PkeskGenerator.
+    private static func buildCompositePKESKPacket(
+        sessionKey: [UInt8],
+        recipient: CompositeKEMRecipient
+    ) throws -> Data {
+        guard recipient.subkeyFingerprint.count == 32,
+              recipient.subkeyPublicKey.count == CompositeKEM.compositePublicBytes else {
+            throw PacketBuilderError.invalidKeyData("ML-KEM recipient subkey is malformed")
+        }
+        let wrapped: [UInt8]
+        let encapsulation: CompositeKEM.Encapsulation
+        do {
+            encapsulation = try CompositeKEM.encapsulate(compositePublic: Data(recipient.subkeyPublicKey))
+            wrapped = [UInt8](try CompositeKEM.wrapSessionKey(kek: encapsulation.kek, sessionKey: Data(sessionKey)))
+        } catch {
+            throw PacketBuilderError.encryptionFailed("ML-KEM encapsulation failed")
+        }
+        guard wrapped.count <= 255 else {
+            throw PacketBuilderError.encryptionFailed("wrapped session key too long")
+        }
+
+        var body: [UInt8] = []
+        body.append(6)
+        body.append(33)
+        body.append(6)
+        body.append(contentsOf: recipient.subkeyFingerprint)
+        body.append(CompositeKEM.algorithmID)
+        body.append(contentsOf: encapsulation.ephemeralPublic)
+        body.append(contentsOf: encapsulation.mlkemCiphertext)
+        body.append(UInt8(wrapped.count))
+        body.append(contentsOf: wrapped)
 
         return buildNewFormatPacket(tag: 1, body: Data(body))
     }

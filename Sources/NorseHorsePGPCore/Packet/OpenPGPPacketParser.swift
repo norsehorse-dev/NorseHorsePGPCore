@@ -80,6 +80,20 @@ struct ParsedPacket {
 
 // MARK: - Decryption Key Info
 
+/// A v6 ML-KEM-768 + X25519 (algorithm 35) secret subkey available for decryption.
+public struct CompositeKEMDecryptionKey {
+    let subkeyFingerprint: [UInt8]  // 32-byte v6 fingerprint of the subkey
+    let secretKey: [UInt8]          // 96 octets: X25519 secret (32) then ML-KEM seed (64)
+}
+
+/// A v6 PKESK for algorithm 35, as CompositeKEM needs it.
+struct ParsedCompositePKESK {
+    let keyFingerprint: [UInt8]     // empty for an anonymous recipient
+    let ephemeralPublic: [UInt8]    // 32
+    let mlkemCiphertext: [UInt8]    // 1088
+    let wrappedSessionKey: [UInt8]
+}
+
 /// Info about a Cv25519 private key available for decryption
 public struct Cv25519DecryptionKey {
     let subkeyID: [UInt8]           // 8-byte key ID
@@ -163,7 +177,8 @@ public final class OpenPGPPacketParser {
     /// list without recursing.
     public static func decryptMessageReturningInnerPackets(
         messageData: Data,
-        decryptionKeys: [Cv25519DecryptionKey]
+        decryptionKeys: [Cv25519DecryptionKey],
+        compositeKeys: [CompositeKEMDecryptionKey] = []
     ) throws -> DecryptedMessageContents {
         // Mirrors decryptMessage's pipeline but captures the inner packet
         // stream before literal-data extraction. Kept as a parallel function
@@ -173,12 +188,15 @@ public final class OpenPGPPacketParser {
         let packets = try parsePackets(data: Array(messageData))
 
         var pkeskPackets: [ParsedPKESK] = []
+        var compositePKESKs: [ParsedCompositePKESK] = []
         var seipdPacket: ParsedSEIPD?
 
         for packet in packets {
             switch packet.tag {
             case 1:
-                if let pkesk = try? parsePKESK(body: packet.body) {
+                if let composite = parseCompositePKESK(body: packet.body) {
+                    compositePKESKs.append(composite)
+                } else if let pkesk = try? parsePKESK(body: packet.body) {
                     pkeskPackets.append(pkesk)
                 }
             case 18:
@@ -190,7 +208,7 @@ public final class OpenPGPPacketParser {
             }
         }
 
-        guard !pkeskPackets.isEmpty else { throw PacketParserError.noPKESKFound }
+        guard !pkeskPackets.isEmpty || !compositePKESKs.isEmpty else { throw PacketParserError.noPKESKFound }
         guard let seipd = seipdPacket else { throw PacketParserError.noSEIPDFound }
 
         // Try to decrypt session key with available keys (same logic as
@@ -199,7 +217,30 @@ public final class OpenPGPPacketParser {
         var sessionAlgorithmID: UInt8?
         var sessionKey: [UInt8]?
 
-        for pkesk in pkeskPackets {
+        // ML-KEM-768 + X25519 session-key packets first. A v6 PKESK names no
+        // cipher: the SEIPDv2 header does, and such a message must be SEIPDv2.
+        if !compositePKESKs.isEmpty, !compositeKeys.isEmpty {
+            guard seipd.version == 2 else {
+                throw PacketParserError.decryptionFailed("ML-KEM session key with a body that is not SEIPDv2")
+            }
+            search: for pkesk in compositePKESKs {
+                for key in compositeKeys {
+                    // An empty fingerprint is an anonymous recipient: try our key.
+                    guard pkesk.keyFingerprint.isEmpty || pkesk.keyFingerprint == key.subkeyFingerprint else { continue }
+                    guard let kek = try? CompositeKEM.decapsulate(
+                              ephemeralPublic: Data(pkesk.ephemeralPublic),
+                              mlkemCiphertext: Data(pkesk.mlkemCiphertext),
+                              compositeSecret: Data(key.secretKey)),
+                          let unwrapped = try? CompositeKEM.unwrapSessionKey(
+                              kek: kek, wrapped: Data(pkesk.wrappedSessionKey)) else { continue }
+                    sessionAlgorithmID = seipd.cipherAlgorithm
+                    sessionKey = [UInt8](unwrapped)
+                    break search
+                }
+            }
+        }
+
+        for pkesk in pkeskPackets where sessionKey == nil {
             if pkesk.version == 3 && pkesk.algorithm == 18 {
                 for key in decryptionKeys {
                     if pkesk.keyID == key.subkeyID || pkesk.keyID == [UInt8](repeating: 0, count: 8) {
@@ -903,6 +944,34 @@ public final class OpenPGPPacketParser {
     }
 
     /// Parse a v3 PKESK: version(1)=3 | keyID(8) | algo(1) | encrypted_session_key
+    /// A v6 PKESK for algorithm 35 (ML-KEM-768 + X25519), or nil for anything
+    /// else, including a malformed one. Layout after the version octet:
+    ///   size(1) | [keyVersion(1) | fingerprint] | algo(35) | X25519 ephemeral(32) |
+    ///   ML-KEM ciphertext(1088) | size(1) | wrapped session key
+    /// The body must end exactly where the wrapped key does.
+    static func parseCompositePKESK(body: [UInt8]) -> ParsedCompositePKESK? {
+        var off = 0
+        func take(_ n: Int) -> [UInt8]? {
+            guard n >= 0, body.count - off >= n else { return nil }
+            defer { off += n }
+            return Array(body[off..<(off + n)])
+        }
+        guard take(1)?.first == 6, let size = take(1)?.first else { return nil }
+        var fingerprint: [UInt8] = []
+        if size > 0 {
+            guard take(1) != nil, let fp = take(Int(size) - 1) else { return nil }
+            fingerprint = fp
+        }
+        guard take(1)?.first == CompositeKEM.algorithmID,
+              let ephemeral = take(CompositeKEM.x25519Bytes),
+              let ciphertext = take(CompositeKEM.mlkemCiphertextBytes),
+              let wrappedLength = take(1)?.first,
+              let wrapped = take(Int(wrappedLength)),
+              off == body.count else { return nil }
+        return ParsedCompositePKESK(keyFingerprint: fingerprint, ephemeralPublic: ephemeral,
+                                    mlkemCiphertext: ciphertext, wrappedSessionKey: wrapped)
+    }
+
     private static func parsePKESKv3(body: [UInt8], off: inout Int) throws -> ParsedPKESK {
         guard off + 9 <= body.count else {
             throw PacketParserError.invalidPacket("PKESK v3 too short")

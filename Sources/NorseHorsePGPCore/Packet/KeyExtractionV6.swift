@@ -89,6 +89,69 @@ public extension OpenPGPPacketParser {
         return parsed.keyMaterial
     }
 
+    /// v6 Ed25519 primary public key (tag 6, algo 27), 32 raw bytes. Identities
+    /// made by generateV6Identity sign with the primary, so this is the key
+    /// their signatures verify under.
+    static func ed25519PrimaryPublicKey(fromV6PublicKey data: Data) throws -> [UInt8] {
+        let packets = try parsePackets(data: Array(data))
+        guard let pub = packets.first(where: { $0.tag == 6 && v6AlgorithmByte($0.body) == 27 }),
+              let parsed = v6PublicPortion(body: pub.body), parsed.keyMaterial.count == 32 else {
+            throw PacketParserError.invalidPacket("No v6 Ed25519 primary key found")
+        }
+        return parsed.keyMaterial
+    }
+
+    // MARK: - ML-KEM-768 + X25519 subkey (algorithm 35)
+
+    /// The ML-KEM-768 + X25519 encryption subkey of a v6 transferable public
+    /// key (tag 14, algo 35), or nil when the key has none.
+    static func compositeRecipient(fromV6PublicKey data: Data) throws -> CompositeKEMRecipient? {
+        let packets = try parsePackets(data: Array(data))
+        guard let pub = packets.first(where: { $0.tag == 14 && v6AlgorithmByte($0.body) == CompositeKEM.algorithmID }) else {
+            return nil
+        }
+        guard let parsed = v6PublicPortion(body: pub.body),
+              parsed.keyMaterial.count == CompositeKEM.compositePublicBytes,
+              parsed.end == pub.body.count else {
+            throw PacketParserError.invalidPacket("Malformed ML-KEM-768 + X25519 subkey")
+        }
+        return CompositeKEMRecipient(
+            subkeyPublicKey: parsed.keyMaterial,
+            subkeyFingerprint: computeV6Fingerprint(packetBody: parsed.publicBody)
+        )
+    }
+
+    /// The ML-KEM-768 + X25519 secret subkey of a v6 transferable secret key
+    /// (tag 7, algo 35), or nil when the key has none. Only unprotected secret
+    /// material (S2K usage 0) is read; a passphrase-protected one throws.
+    static func compositeDecryptionKey(fromV6SecretKey data: Data) throws -> CompositeKEMDecryptionKey? {
+        let packets = try parsePackets(data: Array(data))
+        guard let secret = packets.first(where: { $0.tag == 7 && v6AlgorithmByte($0.body) == CompositeKEM.algorithmID }) else {
+            return nil
+        }
+        guard let parsed = v6PublicPortion(body: secret.body),
+              parsed.keyMaterial.count == CompositeKEM.compositePublicBytes,
+              parsed.end < secret.body.count else {
+            throw PacketParserError.invalidPacket("Malformed ML-KEM-768 + X25519 secret subkey")
+        }
+        guard secret.body[parsed.end] == 0 else {
+            throw PacketParserError.invalidPacket("Passphrase-protected ML-KEM-768 + X25519 subkeys are not supported")
+        }
+        let material = Array(secret.body[(parsed.end + 1)...])
+        guard material.count == CompositeKEM.compositeSecretBytes else {
+            throw PacketParserError.invalidPacket("ML-KEM-768 + X25519 secret material has the wrong length")
+        }
+        // The stored secret has to belong to the public half beside it.
+        guard let rebuilt = try? CompositeKEM.publicKey(fromSecret: Data(material)),
+              [UInt8](rebuilt) == parsed.keyMaterial else {
+            throw PacketParserError.invalidPacket("ML-KEM-768 + X25519 secret does not match its public key")
+        }
+        return CompositeKEMDecryptionKey(
+            subkeyFingerprint: computeV6Fingerprint(packetBody: parsed.publicBody),
+            secretKey: material
+        )
+    }
+
     // MARK: - v6 body helpers
 
     /// Algorithm byte of a v6 key packet body (offset 5), or 0xFF if the body is not v6.
