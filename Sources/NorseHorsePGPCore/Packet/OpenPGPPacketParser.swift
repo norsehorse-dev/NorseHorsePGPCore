@@ -2651,6 +2651,9 @@ public final class OpenPGPPacketParser {
         case 8:  // SHA-256
             let digest = SHA256.hash(data: hashInput)
             digestBytes = Array(digest)
+        case 9:  // SHA-384
+            let digest = SHA384.hash(data: hashInput)
+            digestBytes = Array(digest)
         case 10: // SHA-512
             let digest = SHA512.hash(data: hashInput)
             digestBytes = Array(digest)
