@@ -107,11 +107,10 @@ public extension OpenPGPPacketParser {
         
         if s2kUsage == 0 {
             // Unprotected
-            guard off + 2 <= body.count else { return nil }
-            let dBits = Int(body[off]) << 8 | Int(body[off + 1]); off += 2
-            let dBytes = (dBits + 7) / 8
-            guard off + dBytes <= body.count else { return nil }
-            privateKeyBytes = Array(body[off..<(off + dBytes)])
+            // The secret MPI runs up to the two-octet checksum that ends the packet.
+            guard body.count - off >= 4,
+                  let secretValue = secretValue32(mpiArea: Array(body[off..<(body.count - 2)])) else { return nil }
+            privateKeyBytes = secretValue
             
         } else if s2kUsage == 254 || s2kUsage == 255 {
             // S2K protected
@@ -167,11 +166,8 @@ public extension OpenPGPPacketParser {
                 
                 guard storedHash == computedHash else { throw PacketParserError.invalidPacket("Invalid passphrase") }
                 
-                guard mpiData.count >= 2 else { return nil }
-                let dBits = Int(mpiData[0]) << 8 | Int(mpiData[1])
-                let dBytes = (dBits + 7) / 8
-                guard 2 + dBytes <= mpiData.count else { return nil }
-                privateKeyBytes = Array(mpiData[2..<(2 + dBytes)])
+                guard let secretValue = secretValue32(mpiArea: mpiData) else { return nil }
+                privateKeyBytes = secretValue
             } else {
                 guard decrypted.count >= 2 else { throw PacketParserError.invalidPacket("Invalid passphrase") }
                 let mpiData = Array(decrypted[0..<(decrypted.count - 2)])
@@ -179,11 +175,8 @@ public extension OpenPGPPacketParser {
                 let computedChecksum = mpiData.reduce(UInt16(0)) { ($0 &+ UInt16($1)) }
                 guard storedChecksum == computedChecksum else { throw PacketParserError.invalidPacket("Invalid passphrase") }
                 
-                guard mpiData.count >= 2 else { return nil }
-                let dBits = Int(mpiData[0]) << 8 | Int(mpiData[1])
-                let dBytes = (dBits + 7) / 8
-                guard 2 + dBytes <= mpiData.count else { return nil }
-                privateKeyBytes = Array(mpiData[2..<(2 + dBytes)])
+                guard let secretValue = secretValue32(mpiArea: mpiData) else { return nil }
+                privateKeyBytes = secretValue
             }
         } else {
             return nil
@@ -325,11 +318,10 @@ public extension OpenPGPPacketParser {
         
         if s2kUsage == 0 {
             // Unprotected — MPI is in the clear
-            guard off + 2 <= body.count else { return nil }
-            let dBits = Int(body[off]) << 8 | Int(body[off + 1]); off += 2
-            let dBytes = (dBits + 7) / 8
-            guard off + dBytes <= body.count else { return nil }
-            privateKey = Array(body[off..<(off + dBytes)].reversed())  // Cv25519 scalar is stored big-endian; reverse for CryptoKit
+            // The secret MPI runs up to the two-octet checksum that ends the packet.
+            guard body.count - off >= 4,
+                  let secretValue = secretValue32(mpiArea: Array(body[off..<(body.count - 2)])) else { return nil }
+            privateKey = Array(secretValue.reversed())  // Cv25519 scalar is stored big-endian; reverse for CryptoKit
             
         } else if s2kUsage == 254 || s2kUsage == 255 {
             // S2K protected — need passphrase
@@ -404,11 +396,8 @@ public extension OpenPGPPacketParser {
                 }
                 
                 // Parse the MPI from decrypted data
-                guard mpiData.count >= 2 else { return nil }
-                let dBits = Int(mpiData[0]) << 8 | Int(mpiData[1])
-                let dBytes = (dBits + 7) / 8
-                guard 2 + dBytes <= mpiData.count else { return nil }
-                let rawMPI = Array(mpiData[2..<(2 + dBytes)])
+                guard let secretValue = secretValue32(mpiArea: mpiData) else { return nil }
+                let rawMPI = secretValue
                 // GnuPG stores Cv25519 private keys as big-endian MPIs,
                 // but CryptoKit expects little-endian (RFC 7748).
                 // Reverse the bytes for X25519 key agreement.
@@ -427,11 +416,8 @@ public extension OpenPGPPacketParser {
                     throw PacketParserError.invalidPacket("Invalid passphrase")
                 }
                 
-                guard mpiData.count >= 2 else { return nil }
-                let dBits = Int(mpiData[0]) << 8 | Int(mpiData[1])
-                let dBytes = (dBits + 7) / 8
-                guard 2 + dBytes <= mpiData.count else { return nil }
-                let rawMPI = Array(mpiData[2..<(2 + dBytes)])
+                guard let secretValue = secretValue32(mpiArea: mpiData) else { return nil }
+                let rawMPI = secretValue
                 privateKey = rawMPI.reversed()
             }
             
@@ -639,4 +625,36 @@ public extension OpenPGPPacketParser {
         }
         return false
     }
+}
+
+
+/// Reads a 32-octet secret value (an Ed25519 seed or a Cv25519 scalar) from
+/// `mpiArea`, which holds exactly one MPI: its two-octet bit count and its
+/// value, with any checksum already removed.
+///
+/// Two layouts are accepted:
+///   - A correct MPI, whose leading zero octets have been removed. The value is
+///     padded back to 32 octets.
+///   - The layout this core wrote before it was corrected: the bit count of the
+///     value without its leading zero octets, followed by all 32 octets. Read
+///     by its count it comes out an octet short, which made about one new
+///     identity in 256 unable to sign at all.
+///
+/// Returns nil for anything else.
+func secretValue32(mpiArea: [UInt8]) -> [UInt8]? {
+    guard mpiArea.count >= 2 else { return nil }
+    let bits = Int(mpiArea[0]) << 8 | Int(mpiArea[1])
+    let length = (bits + 7) / 8
+    guard length <= 32 else { return nil }
+
+    if mpiArea.count == 2 + length {
+        return [UInt8](repeating: 0, count: 32 - length) + mpiArea[2...]
+    }
+    if mpiArea.count == 2 + 32 {
+        let value = Array(mpiArea[2...])
+        let trimmed = value.drop(while: { $0 == 0 })
+        let actualBits = trimmed.first.map { trimmed.count * 8 - $0.leadingZeroBitCount } ?? 0
+        return actualBits == bits ? value : nil
+    }
+    return nil
 }

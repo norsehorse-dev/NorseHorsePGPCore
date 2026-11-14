@@ -927,15 +927,8 @@ public final class OpenPGPPacketBuilder {
         let rBytes = Array(sigBytes[0..<32])
         let sBytes = Array(sigBytes[32..<64])
 
-        let rBits = UInt16(rBytes.count * 8 - countLeadingZeroBits(rBytes))
-        sigBody.append(UInt8((rBits >> 8) & 0xFF))
-        sigBody.append(UInt8(rBits & 0xFF))
-        sigBody.append(contentsOf: rBytes)
-
-        let sBits = UInt16(sBytes.count * 8 - countLeadingZeroBits(sBytes))
-        sigBody.append(UInt8((sBits >> 8) & 0xFF))
-        sigBody.append(UInt8(sBits & 0xFF))
-        sigBody.append(contentsOf: sBytes)
+        sigBody.append(contentsOf: canonicalMPI(rBytes))
+        sigBody.append(contentsOf: canonicalMPI(sBytes))
 
         return buildNewFormatPacketBytes(tag: 2, body: sigBody)
     }
@@ -1193,6 +1186,18 @@ public final class OpenPGPPacketBuilder {
         case 7, 8, 9: return 16  // AES-128/192/256 all use 128-bit blocks
         default: throw PacketBuilderError.encryptionFailed("Unsupported cipher: \(algorithmID)")
         }
+    }
+
+    /// An OpenPGP MPI: a two-octet bit count, then the value with its leading
+    /// zero octets removed. Writing the full-width value under a bit count
+    /// that excludes its leading zero octets (which this file used to do for
+    /// signatures) makes a packet no reader can parse, about one time in 128
+    /// for a signature, since R or S starts with a zero octet that often.
+    private static func canonicalMPI(_ bytes: [UInt8]) -> [UInt8] {
+        let value = Array(bytes.drop(while: { $0 == 0 }))
+        guard let first = value.first else { return [0, 0] }
+        let bits = value.count * 8 - first.leadingZeroBitCount
+        return [UInt8((bits >> 8) & 0xFF), UInt8(bits & 0xFF)] + value
     }
 
     private static func countLeadingZeroBits(_ bytes: [UInt8]) -> Int {

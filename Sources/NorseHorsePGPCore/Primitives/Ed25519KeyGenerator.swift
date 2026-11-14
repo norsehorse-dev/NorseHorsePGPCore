@@ -220,12 +220,10 @@ class Ed25519KeyGenerator {
             body.append(0)  // S2K usage: 0 = not encrypted
             
             // Secret key MPI
-            let dBits = UInt16(privateKey.count * 8 - countLeadingZeroBits(privateKey))
-            body.append(contentsOf: dBits.bigEndianBytes)
-            body.append(contentsOf: privateKey)
+            let mpiData = canonicalMPI(privateKey)
+            body.append(contentsOf: mpiData)
             
             // Two-octet checksum of all secret MPI bytes (MPI length + MPI data)
-            let mpiData: [UInt8] = dBits.bigEndianBytes + privateKey
             let checksum = mpiData.reduce(UInt16(0)) { ($0 &+ UInt16($1)) }
             body.append(contentsOf: checksum.bigEndianBytes)
         }
@@ -260,12 +258,10 @@ class Ed25519KeyGenerator {
             body.append(0)  // S2K usage: 0 = not encrypted
             
             // Secret key MPI
-            let dBits = UInt16(privateKey.count * 8 - countLeadingZeroBits(privateKey))
-            body.append(contentsOf: dBits.bigEndianBytes)
-            body.append(contentsOf: privateKey)
+            let mpiData = canonicalMPI(privateKey)
+            body.append(contentsOf: mpiData)
             
             // Two-octet checksum of all secret MPI bytes
-            let mpiData: [UInt8] = dBits.bigEndianBytes + privateKey
             let checksum = mpiData.reduce(UInt16(0)) { ($0 &+ UInt16($1)) }
             body.append(contentsOf: checksum.bigEndianBytes)
         }
@@ -311,9 +307,7 @@ class Ed25519KeyGenerator {
         
         // Build plaintext: MPI data + SHA-1 hash of MPI data
         var plaintext: [UInt8] = []
-        let dBits = UInt16(privateKey.count * 8 - countLeadingZeroBits(privateKey))
-        plaintext.append(contentsOf: dBits.bigEndianBytes)
-        plaintext.append(contentsOf: privateKey)
+        plaintext.append(contentsOf: canonicalMPI(privateKey))
         
         // SHA-1 checksum of plaintext (for S2K usage byte 254)
         var sha1Hash = [UInt8](repeating: 0, count: Int(CC_SHA1_DIGEST_LENGTH))
@@ -519,13 +513,8 @@ class Ed25519KeyGenerator {
         let rBytes = Array(sigBytes[0..<32])
         let sBytes = Array(sigBytes[32..<64])
         
-        let rBits = UInt16(rBytes.count * 8 - countLeadingZeroBits(rBytes))
-        sigBody.append(contentsOf: rBits.bigEndianBytes)
-        sigBody.append(contentsOf: rBytes)
-        
-        let sBits = UInt16(sBytes.count * 8 - countLeadingZeroBits(sBytes))
-        sigBody.append(contentsOf: sBits.bigEndianBytes)
-        sigBody.append(contentsOf: sBytes)
+        sigBody.append(contentsOf: canonicalMPI(rBytes))
+        sigBody.append(contentsOf: canonicalMPI(sBytes))
         
         return sigBody
     }
@@ -585,13 +574,8 @@ class Ed25519KeyGenerator {
         let rBytes = Array(sigBytes[0..<32])
         let sBytes = Array(sigBytes[32..<64])
         
-        let rBits = UInt16(rBytes.count * 8 - countLeadingZeroBits(rBytes))
-        sigBody.append(contentsOf: rBits.bigEndianBytes)
-        sigBody.append(contentsOf: rBytes)
-        
-        let sBits = UInt16(sBytes.count * 8 - countLeadingZeroBits(sBytes))
-        sigBody.append(contentsOf: sBits.bigEndianBytes)
-        sigBody.append(contentsOf: sBytes)
+        sigBody.append(contentsOf: canonicalMPI(rBytes))
+        sigBody.append(contentsOf: canonicalMPI(sBytes))
         
         return sigBody
     }
@@ -1000,12 +984,8 @@ class Ed25519KeyGenerator {
 
         let rBytes = Array(sigBytes[0..<32])
         let sBytes = Array(sigBytes[32..<64])
-        let rBits = UInt16(rBytes.count * 8 - countLeadingZeroBits(rBytes))
-        sigBody.append(contentsOf: rBits.bigEndianBytes)
-        sigBody.append(contentsOf: rBytes)
-        let sBits = UInt16(sBytes.count * 8 - countLeadingZeroBits(sBytes))
-        sigBody.append(contentsOf: sBits.bigEndianBytes)
-        sigBody.append(contentsOf: sBytes)
+        sigBody.append(contentsOf: canonicalMPI(rBytes))
+        sigBody.append(contentsOf: canonicalMPI(sBytes))
         return sigBody
     }
 
@@ -1061,6 +1041,18 @@ class Ed25519KeyGenerator {
     
     // MARK: - Utilities
     
+    /// An OpenPGP MPI: a two-octet bit count, then the value with its leading
+    /// zero octets removed. Writing the full-width value under a bit count
+    /// that excludes its leading zero octets (which this file used to do for
+    /// signatures) makes a packet no reader can parse, about one time in 128
+    /// for a signature, since R or S starts with a zero octet that often.
+    private static func canonicalMPI(_ bytes: [UInt8]) -> [UInt8] {
+        let value = Array(bytes.drop(while: { $0 == 0 }))
+        guard let first = value.first else { return [0, 0] }
+        let bits = value.count * 8 - first.leadingZeroBitCount
+        return [UInt8((bits >> 8) & 0xFF), UInt8(bits & 0xFF)] + value
+    }
+
     private static func countLeadingZeroBits(_ bytes: [UInt8]) -> Int {
         for (i, byte) in bytes.enumerated() {
             if byte != 0 {

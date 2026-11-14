@@ -2622,9 +2622,48 @@ public final class OpenPGPPacketParser {
         }
     }
 
+    /// Reads a signature written by this core's encoder before it was corrected.
+    ///
+    /// That encoder computed each MPI's bit count correctly but then wrote all
+    /// 32 octets of R and S, leading zeros included. When R or S starts with a
+    /// zero octet the count says 31 octets and 32 follow, so reading by the
+    /// count takes the wrong octets and the signature fails. The value is all
+    /// there, only mislabelled, so it can be read back exactly: if the two MPIs
+    /// do not fill the data by their own counts, and the data is exactly the 68
+    /// octets two full-width values take, and each count is what the full
+    /// 32-octet value gives, then R and S are the two 32-octet halves.
+    ///
+    /// Returns nil for anything else, including every correctly written
+    /// signature. Whether the recovered signature verifies is still decided by
+    /// Ed25519, so this cannot make a forged signature pass.
+    static func mislabelledEdDSASignature(_ data: [UInt8]) -> [UInt8]? {
+        guard data.count == 68 else { return nil }
+
+        func bitLength(_ value: ArraySlice<UInt8>) -> Int {
+            let trimmed = value.drop(while: { $0 == 0 })
+            guard let first = trimmed.first else { return 0 }
+            return trimmed.count * 8 - first.leadingZeroBitCount
+        }
+
+        // Does it parse cleanly as written?
+        let rBits = Int(data[0]) << 8 | Int(data[1])
+        let rLength = (rBits + 7) / 8
+        if 2 + rLength + 2 <= data.count {
+            let sBitsAsWritten = Int(data[2 + rLength]) << 8 | Int(data[2 + rLength + 1])
+            if 2 + rLength + 2 + (sBitsAsWritten + 7) / 8 == data.count { return nil }
+        }
+
+        let r = data[2..<34]
+        let sBits = Int(data[34]) << 8 | Int(data[35])
+        let s = data[36..<68]
+        guard rBits == bitLength(r), sBits == bitLength(s) else { return nil }
+        return Array(r) + Array(s)
+    }
+
     /// Extract R and S from EdDSA MPI-encoded signature data (v4 format).
     /// Returns concatenated 64 bytes (R || S).
     private static func extractEdDSAMPIs(from data: [UInt8]) throws -> [UInt8] {
+        if let recovered = mislabelledEdDSASignature(data) { return recovered }
         var off = 0
 
         // R MPI
