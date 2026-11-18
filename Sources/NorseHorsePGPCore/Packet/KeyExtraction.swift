@@ -532,7 +532,7 @@ public extension OpenPGPPacketParser {
         )
     }
 
-    private static func s2kCipherKeySize(_ cipherID: UInt8) throws -> Int {
+    internal static func s2kCipherKeySize(_ cipherID: UInt8) throws -> Int {
         switch cipherID {
         case 7: return 16   // AES-128
         case 8: return 24   // AES-192
@@ -541,7 +541,7 @@ public extension OpenPGPPacketParser {
         }
     }
 
-    private static func aesCFBDecrypt(ciphertext: [UInt8], key: [UInt8], iv: [UInt8]) -> [UInt8] {
+    internal static func aesCFBDecrypt(ciphertext: [UInt8], key: [UInt8], iv: [UInt8]) -> [UInt8] {
         var plaintext = [UInt8](repeating: 0, count: ciphertext.count)
         var currentIV = iv
         let blockSize = 16

@@ -14,7 +14,7 @@ public extension OpenPGPPacketParser {
 
     /// Convert a transferable secret key (armored or raw) into an armored
     /// transferable public key. Supports v4 Ed25519 (EdDSA, algo 22) primaries
-    /// and Cv25519 (ECDH, algo 18) subkeys — the only shapes CarrierPony uses.
+    /// with Cv25519 (ECDH, algo 18) subkeys, and v6 keys of any algorithm.
     static func transferablePublicKey(fromSecretKey data: Data) throws -> String {
         let packets = try parsePackets(data: [UInt8](data))
         var out: [UInt8] = []
@@ -40,6 +40,18 @@ public extension OpenPGPPacketParser {
     // MARK: - Public-portion parsing
 
     private static func publicPortion(ofKeyBody body: [UInt8]) throws -> [UInt8] {
+        // v6: version(1) | creation(4) | algorithm(1) | material length(4) |
+        // material. The length is explicit, so any algorithm is carried over
+        // as it is (Ed25519, X25519, ML-KEM-768 + X25519).
+        if body.first == 6 {
+            guard body.count > 10 else { throw PacketParserError.invalidPacket("Truncated v6 key packet") }
+            let materialLength = Int(body[6]) << 24 | Int(body[7]) << 16 | Int(body[8]) << 8 | Int(body[9])
+            let end = 10 + materialLength
+            guard materialLength > 0, end <= body.count else {
+                throw PacketParserError.invalidPacket("Truncated v6 key material")
+            }
+            return Array(body[0..<end])
+        }
         var off = 0
         guard body.count > 6, body[0] == 4 else {
             throw PacketParserError.invalidPacket("Unsupported key packet (v4 only)")

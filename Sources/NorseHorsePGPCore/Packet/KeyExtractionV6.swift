@@ -122,9 +122,9 @@ public extension OpenPGPPacketParser {
     }
 
     /// The ML-KEM-768 + X25519 secret subkey of a v6 transferable secret key
-    /// (tag 7, algo 35), or nil when the key has none. Only unprotected secret
-    /// material (S2K usage 0) is read; a passphrase-protected one throws.
-    static func compositeDecryptionKey(fromV6SecretKey data: Data) throws -> CompositeKEMDecryptionKey? {
+    /// (tag 7, algo 35), or nil when the key has none. Protected material is
+    /// unlocked with `passphrase` (see `v6SecretMaterial`); without one it throws.
+    static func compositeDecryptionKey(fromV6SecretKey data: Data, passphrase: String? = nil) throws -> CompositeKEMDecryptionKey? {
         let packets = try parsePackets(data: Array(data))
         guard let secret = packets.first(where: { $0.tag == 7 && v6AlgorithmByte($0.body) == CompositeKEM.algorithmID }) else {
             return nil
@@ -134,10 +134,14 @@ public extension OpenPGPPacketParser {
               parsed.end < secret.body.count else {
             throw PacketParserError.invalidPacket("Malformed ML-KEM-768 + X25519 secret subkey")
         }
-        guard secret.body[parsed.end] == 0 else {
-            throw PacketParserError.invalidPacket("Passphrase-protected ML-KEM-768 + X25519 subkeys are not supported")
+        let material: [UInt8]
+        if secret.body[parsed.end] == 0 {
+            material = Array(secret.body[(parsed.end + 1)...])
+        } else {
+            material = try v6SecretMaterial(
+                body: secret.body, publicEnd: parsed.end, packetTag: secret.tag,
+                passphrase: passphrase, length: CompositeKEM.compositeSecretBytes)
         }
-        let material = Array(secret.body[(parsed.end + 1)...])
         guard material.count == CompositeKEM.compositeSecretBytes else {
             throw PacketParserError.invalidPacket("ML-KEM-768 + X25519 secret material has the wrong length")
         }
@@ -150,6 +154,22 @@ public extension OpenPGPPacketParser {
             subkeyFingerprint: computeV6Fingerprint(packetBody: parsed.publicBody),
             secretKey: material
         )
+    }
+
+    /// True when a v6 transferable secret key needs a passphrase before it can
+    /// sign or decrypt: its signing key (a signing subkey when it has one, else
+    /// the primary) or its ML-KEM-768 + X25519 subkey is protected. An export
+    /// can protect its keys one by one, so both are looked at.
+    static func v6SecretKeyNeedsPassphrase(_ data: Data) -> Bool {
+        guard let packets = try? parsePackets(data: Array(data)) else { return false }
+        func isLocked(_ packet: ParsedPacket?) -> Bool {
+            guard let packet, let pub = v6PublicPortion(body: packet.body), pub.end < packet.body.count else { return false }
+            return packet.body[pub.end] != 0
+        }
+        let signing = packets.first(where: { $0.tag == 7 && v6AlgorithmByte($0.body) == 27 })
+                   ?? packets.first(where: { $0.tag == 5 && v6AlgorithmByte($0.body) == 27 })
+        let composite = packets.first(where: { $0.tag == 7 && v6AlgorithmByte($0.body) == CompositeKEM.algorithmID })
+        return isLocked(signing) || isLocked(composite)
     }
 
     // MARK: - v6 body helpers
@@ -180,9 +200,12 @@ public extension OpenPGPPacketParser {
     }
 
     /// Extract raw secret material from a v6 secret key body. Handles unprotected
-    /// (S2K usage octet 0) and Argon2id + AES-OCB protected (S2K usage 253) keys,
-    /// per RFC 9580 §5.5.3.
-    private static func v6SecretMaterial(body: [UInt8], publicEnd: Int, packetTag: UInt8, passphrase: String?) throws -> [UInt8] {
+    /// (S2K usage octet 0), Argon2id + AEAD protected (S2K usage 253) and CFB
+    /// protected (S2K usage 254) keys, per RFC 9580 §5.5.3. `length` is the size
+    /// of the secret material: 32 for Ed25519 and X25519, 96 for ML-KEM-768 +
+    /// X25519. One export can mix the two protections (PGPony Android keeps its
+    /// classic keys under 254 and its ML-KEM subkey under 253).
+    private static func v6SecretMaterial(body: [UInt8], publicEnd: Int, packetTag: UInt8, passphrase: String?, length: Int = 32) throws -> [UInt8] {
         var off = publicEnd
         guard off < body.count else {
             throw PacketParserError.invalidPacket("v6 secret key: missing S2K usage octet")
@@ -190,11 +213,62 @@ public extension OpenPGPPacketParser {
         let s2kUsage = body[off]; off += 1
 
         if s2kUsage == 0 {
-            // Unprotected: raw 32-byte private material, no checksum.
-            guard off + 32 <= body.count else {
+            // Unprotected: raw private material, no checksum.
+            guard off + length <= body.count else {
                 throw PacketParserError.invalidPacket("v6 secret key: private material truncated")
             }
-            return Array(body[off..<(off + 32)])
+            return Array(body[off..<(off + length)])
+        }
+
+        if s2kUsage == 254 {
+            // S2K usage 254 (CFB). Wire layout after the usage octet:
+            //   len1(1) | cipher(1) | len2(1) | S2K specifier(len2) | IV(16) |
+            //   CFB(material | SHA-1(material))
+            guard let pass = passphrase, !pass.isEmpty else {
+                throw PacketParserError.invalidPacket("v6 protected secret key requires a passphrase")
+            }
+            guard off + 3 <= body.count else { throw PacketParserError.invalidPacket("v6 secret: truncated (algos)") }
+            off += 1  // len1
+            let cipherAlgo = body[off]; off += 1
+            let specLen = Int(body[off]); off += 1
+            guard specLen >= 2, off + specLen <= body.count else {
+                throw PacketParserError.invalidPacket("v6 secret: truncated (S2K specifier)")
+            }
+            let spec = Array(body[off..<(off + specLen)]); off += specLen
+            let s2kType = spec[0]
+            let hashAlgo = spec[1]
+            var salt: [UInt8] = []
+            var codedCount: UInt8 = 0
+            switch (s2kType, spec.count) {
+            case (0, 2):
+                break
+            case (1, 10):
+                salt = Array(spec[2..<10])
+            case (3, 11):
+                salt = Array(spec[2..<10])
+                codedCount = spec[10]
+            default:
+                throw PacketParserError.invalidPacket("v6 secret: unsupported S2K specifier (type \(s2kType))")
+            }
+            // S2K.deriveKey knows SHA-1 and SHA-256 only.
+            guard hashAlgo == 2 || hashAlgo == 8 else {
+                throw PacketParserError.invalidPacket("v6 secret: unsupported S2K hash \(hashAlgo)")
+            }
+            let keySize = try s2kCipherKeySize(cipherAlgo)
+            let key = S2K.deriveKey(
+                passphrase: pass, salt: salt, s2kType: s2kType, hashAlgo: hashAlgo,
+                codedCount: codedCount, keySize: keySize)
+            guard off + 16 <= body.count else { throw PacketParserError.invalidPacket("v6 secret: truncated (IV)") }
+            let iv = Array(body[off..<(off + 16)]); off += 16
+            let decrypted = aesCFBDecrypt(ciphertext: Array(body[off...]), key: key, iv: iv)
+            guard decrypted.count == length + 20 else {
+                throw PacketParserError.invalidPacket("v6 secret: private material has the wrong length")
+            }
+            let material = Array(decrypted[0..<length])
+            guard Array(Insecure.SHA1.hash(data: Data(material))) == Array(decrypted[length...]) else {
+                throw PacketParserError.invalidPacket("Invalid passphrase")
+            }
+            return material
         }
 
         guard s2kUsage == 253 else {
@@ -221,6 +295,11 @@ public extension OpenPGPPacketParser {
         }
         let salt = Array(spec[1..<17])
         let t = Int(spec[17]); let p = Int(spec[18]); let m = Int(spec[19])
+        // 2^18 KiB is 256 MiB. More than that does not fit on a phone, and a
+        // crafted key file must not be able to ask for it.
+        guard m <= 18 else {
+            throw PacketParserError.invalidPacket("v6 secret: Argon2 memory 2^\(m) KiB is more than this device allows")
+        }
 
         let nonceLen = AEADService.nonceSize(for: aeadAlgo)
         guard off + nonceLen <= body.count else { throw PacketParserError.invalidPacket("v6 secret: truncated (nonce)") }
@@ -234,7 +313,11 @@ public extension OpenPGPPacketParser {
             passphrase: pass, salt: salt, iterations: t, parallelism: p, memoryExponent: m, hashLength: 32)
         let kek = try hkdfSHA256(ikm: argon2Key, salt: [], info: [tagID, 0x06, cipherAlgo, aeadAlgo], outputLength: 32)
         let aad = [tagID] + Array(body[0..<publicEnd])
-        return try AEADService.decryptWithAppendedTag(
+        let material = try AEADService.decryptWithAppendedTag(
             data: ciphertextWithTag, key: kek, nonce: nonce, aeadAlgo: aeadAlgo, associatedData: aad)
+        guard material.count == length else {
+            throw PacketParserError.invalidPacket("v6 secret: private material has the wrong length")
+        }
+        return material
     }
 }
