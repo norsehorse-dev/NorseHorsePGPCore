@@ -1358,13 +1358,6 @@ public final class OpenPGPPacketParser {
             throw PacketParserError.decryptionFailed("Prefix quick-check failed — wrong session key")
         }
 
-        // Hex dump entire decrypted output for debugging
-        let hexDump = decrypted.enumerated().map { i, b in
-            let prefix = (i % 16 == 0) ? "\n  [\(String(format: "%03d", i))] " : ""
-            return "\(prefix)\(String(format: "%02x", b))"
-        }.joined(separator: " ")
-        pgpDebugLog("DEBUG SEIPD: full decrypted hex:\(hexDump)")
-
         // Strip prefix (bs+2 bytes)
         let payload = Array(decrypted[(bs + 2)...])
         pgpDebugLog("DEBUG SEIPD: decrypted total=\(decrypted.count), payload=\(payload.count)")
